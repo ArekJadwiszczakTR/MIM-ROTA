@@ -92,6 +92,7 @@
   .unsavedbar{background:var(--unsaved-bg);border:1px solid var(--unsaved-border);color:var(--unsaved-fg);font-size:12.5px;padding:8px 12px;border-radius:8px;margin-bottom:14px;display:flex;align-items:center;gap:10px;}
   .unsavedbar button{border:none;background:#dc2626;color:#fff;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;}
   .unsavedbar button.ghost2{background:var(--card-bg);color:var(--unsaved-fg);border:1px solid var(--unsaved-border);}
+  #bulkBar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);margin:0;z-index:40;box-shadow:0 6px 24px rgba(0,0,0,.28);max-width:calc(100vw - 24px);}
   .clocks{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;}
   .clock{flex:1;min-width:170px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:10px;padding:10px 12px;border-left:4px solid #ccc;}
   .clock.myclock{border-left-color:var(--muted-soft);}
@@ -1531,7 +1532,9 @@
         `It shows one card per region, using that region's own local date.`,
         `It always shows the real current moment. Prev / Next / Today do nothing here.`,
         `A region-wide bank holiday today appears as a red note on that region's card.`,
-        `For a region with "Weekend Cover shifts count as on-call" turned on, weekend Cover shifts count as on-call here.`
+        `For a region with "Weekend Cover shifts count as on-call" turned on, weekend Cover shifts count as on-call here.`,
+        `Each on-call row shows its day, so someone covering both Saturday and Sunday appears twice - once per day.`,
+        `Open (unassigned) shifts, such as a restriction marker, are listed under "On shift today" but never count as on-call.`
       ])
     ]},
     { area: 'Viewing the rota', title: 'On-call tracker', what: `A fairness check: who has covered the most on-call weekends and bank holidays this year.`, sections: [
@@ -1678,7 +1681,8 @@
       hTips([
         `It picks the shift type for you: the region's on-call type, or its Cover type if "Weekend Cover shifts count as on-call" is on.`,
         `The rotation order is fixed, so running it again later carries on from where it left off.`,
-        `Anyone already busy or on holiday is skipped for that weekend. If nobody is free, the weekend is left empty and the confirmation says so.`
+        `Anyone already busy or on holiday is skipped for that weekend. If nobody is free, the weekend is left empty and the confirmation says so.`,
+        `People who work Management (MGMT) shifts are left out when the region's setting "Weekend rotation skips people on Management (MGMT) shifts" is on. It is on by default for AMERS. MGMT is never used as the shift type.`
       ])
     ]},
     { area: 'Planning tools', title: 'Autofill from last month', what: `Copy last month's weekly pattern into the month you are looking at.`, sections: [
@@ -1966,6 +1970,7 @@
       // Holiday shift whenever a holiday applies to them - see
       // applyLeadHolidayBH below. Empty string means "no one" (default).
       if(g.leadPerson == null) g.leadPerson = '';
+      if(g.weekendSkipMgmt == null) g.weekendSkipMgmt = (g.id === 'amers');
     });
     // Tracks the last time each scope of the "Export 3-month schedule" button
     // was published to SharePoint, so anyone opening that dialog can see
@@ -2693,6 +2698,25 @@
     const label = (def && def.label || '').toLowerCase();
     return label.indexOf('leave') !== -1 || label.indexOf('off') !== -1 || label.indexOf('bank holiday') !== -1;
   }
+  // Management and change-restriction types are never a region's regular
+  // Cover shift, even when they're the most used type in that region.
+  function isNonCoverType(type, typeDefByCodeFn){
+    if(type === 'MGMT') return true;
+    const def = typeDefByCodeFn(type);
+    const text = ((def && def.label) || '') + ' ' + type;
+    return /management|restrict|synergy/i.test(text);
+  }
+  // Roster members a weekend rotation may use for this region. With
+  // g.weekendSkipMgmt on, anyone who has a Management (MGMT) shift in this
+  // region is left out of the rotation.
+  function weekendRotationRoster(rotaState, g){
+    if(!g.weekendSkipMgmt) return g.roster.slice();
+    const mgmt = {};
+    (rotaState.shifts||[]).forEach(function(s){
+      if(s.groupId===g.id && s.type==='MGMT' && s.person) mgmt[s.person] = true;
+    });
+    return g.roster.filter(function(p){ return !mgmt[p]; });
+  }
   // ---- Weekend rotation fill (editors only) ----
   // Which shift-type code represents "regular Cover" for this region, guessed
   // from whatever non-time-off, non-on-call type already appears most often
@@ -2703,6 +2727,7 @@
     (rotaState.shifts||[]).forEach(function(s){
       if(s.groupId!==groupId || !s.type) return;
       if(isTimeOffType(s.type, typeDefByCodeFn) || isOnCallType(s.type, typeDefByCodeFn)) return;
+      if(isNonCoverType(s.type, typeDefByCodeFn)) return;
       tally[s.type] = (tally[s.type]||0) + 1;
     });
     let best = null, bestCount = 0;
@@ -2766,7 +2791,9 @@
     const g = (rotaState.groups||[]).find(function(x){ return x.id===groupId; });
     if(!g || !Array.isArray(g.roster) || !g.roster.length) return result;
     const def = typeDefByCodeFn(typeCode);
-    const rosterLen = g.roster.length;
+    const roster = weekendRotationRoster(rotaState, g);
+    if(!roster.length) return result;
+    const rosterLen = roster.length;
     for(let w=0; w<numWeekends; w++){
       const satStr = addDaysToYmd(startSatStr, w*7);
       const sunStr = addDaysToYmd(satStr, 1);
@@ -2774,7 +2801,7 @@
       let assigned = null;
       for(let attempt=0; attempt<rosterLen; attempt++){
         const idx = (baseIdx + attempt) % rosterLen;
-        const person = g.roster[idx];
+        const person = roster[idx];
         const busy = (rotaState.shifts||[]).some(function(s){
           return s.groupId===groupId && s.person===person && (s.date===satStr || s.date===sunStr);
         });
@@ -2808,7 +2835,7 @@
         return s.groupId===g.id && s.date===todayStr;
       }).sort(personSort);
       const onCallShifts = (rotaState.shifts||[]).filter(function(s){
-        return s.groupId===g.id && (s.date===weekend.sat || s.date===weekend.sun) && countsAsOnCallShift(s, g, typeDefByCodeFn);
+        return s.groupId===g.id && s.person && (s.date===weekend.sat || s.date===weekend.sun) && countsAsOnCallShift(s, g, typeDefByCodeFn);
       }).sort(function(a,b){
         if(a.date!==b.date) return a.date<b.date ? -1 : 1;
         return personSort(a,b);
@@ -3943,9 +3970,13 @@
     return '<th class="'+cls+'"'+titleAttr+'>'+wd+'<br>'+d.getDate()+holidayMark+'</th>';
   }
 
-  function statusRowHtml(s, typeDefByCodeFn){
+  function statusRowHtml(s, typeDefByCodeFn, withDay){
     const def = typeDefByCodeFn(s.type) || {};
-    const timeText = def.allDay ? 'All day' : ((s.start||'?') + ' - ' + (s.end||'?'));
+    let timeText = def.allDay ? 'All day' : ((s.start||'?') + ' - ' + (s.end||'?'));
+    if(withDay && s.date){
+      const p = s.date.split('-').map(Number);
+      timeText = new Date(p[0], p[1]-1, p[2]).toLocaleDateString(undefined, {weekday:'short', day:'numeric', month:'short'}) + ', ' + timeText;
+    }
     return '<div class="cmp-issue">' +
       '<span class="cmp-tag" style="background:'+(def.color||'#6b7280')+'">'+escapeHtml(def.label||s.type||'-')+'</span>' +
       '<b>'+escapeHtml(s.person||'(unnamed)')+'</b> - '+escapeHtml(timeText) +
@@ -3975,7 +4006,7 @@
         ? r.todayShifts.map(function(s){ return statusRowHtml(s, typeDefByCodeFn); }).join('')
         : '<p class="repeathint">Nothing scheduled today.</p>';
       const onCallRows = r.onCallShifts.length
-        ? r.onCallShifts.map(function(s){ return statusRowHtml(s, typeDefByCodeFn); }).join('')
+        ? r.onCallShifts.map(function(s){ return statusRowHtml(s, typeDefByCodeFn, true); }).join('')
         : '<p class="repeathint">No on-call coverage scheduled this weekend.</p>';
       const todayHoliday = holidayOn(g, r.todayStr);
       return '<div class="group">' +
@@ -4513,7 +4544,7 @@
         : '<p class="repeathint">Nothing scheduled today.</p>';
       html += '<div class="setsection-title" style="margin-top:14px;">On-call this weekend ('+fmtWeekendRange(r.weekend.sat, r.weekend.sun)+')</div>';
       html += r.onCallShifts.length
-        ? r.onCallShifts.map(function(s){ return statusRowHtml(s, typeDefByCode); }).join('')
+        ? r.onCallShifts.map(function(s){ return statusRowHtml(s, typeDefByCode, true); }).join('')
         : '<p class="repeathint">No on-call coverage scheduled this weekend.</p>';
       body.innerHTML = html;
       wrap.appendChild(body);
@@ -5621,6 +5652,10 @@
           '<label class="inline"><input type="checkbox" class="weekendOnCallToggle"> Weekend Cover shifts count as on-call</label>' +
         '</div>' +
         '<div style="font-size:10.5px;color:var(--muted-soft);margin:-6px 0 6px;">Turn this on if this region has no separate on-call shift type and just covers weekends with the regular Cover shift - otherwise "On-call this weekend" and the On-call tracker will always show empty/zero for it.</div>' +
+        '<div class="setrow-line">' +
+          '<label class="inline"><input type="checkbox" class="skipMgmtToggle"> Weekend rotation skips people on Management (MGMT) shifts</label>' +
+        '</div>' +
+        '<div style="font-size:10.5px;color:var(--muted-soft);margin:-6px 0 6px;">Fill weekend rotation leaves out anyone in this region who has an MGMT shift, so only the rest of the roster is rotated through.</div>' +
         '<div class="setrow-line" style="flex-direction:column;align-items:stretch;">' +
           '<div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px;">Per-person timezone override - for someone whose own local time (and DST behavior) doesn\'t match the rest of this region (e.g. William on US time, DST-observing, while the rest of AMERS is on Mexico time, which no longer observes DST)</div>' +
           '<div class="personTzList"></div>' +
@@ -5724,6 +5759,10 @@
       const weekendOnCallEl = row.querySelector('.weekendOnCallToggle');
       weekendOnCallEl.checked = !!g.weekendCoverIsOnCall;
       weekendOnCallEl.addEventListener('change', function(){ g.weekendCoverIsOnCall = weekendOnCallEl.checked; });
+
+      const skipMgmtEl = row.querySelector('.skipMgmtToggle');
+      skipMgmtEl.checked = !!g.weekendSkipMgmt;
+      skipMgmtEl.addEventListener('change', function(){ g.weekendSkipMgmt = skipMgmtEl.checked; });
 
       const leadPersonEl = row.querySelector('.leadPersonSelect');
       function refreshLeadPersonOptions(){
@@ -6103,6 +6142,7 @@
           existing.defaultUtcStartMin = dg.defaultUtcStartMin;
           existing.defaultUtcEndMin = dg.defaultUtcEndMin;
           existing.weekendCoverIsOnCall = !!dg.weekendCoverIsOnCall;
+          existing.weekendSkipMgmt = !!dg.weekendSkipMgmt;
           existing.personTimezones = dg.personTimezones;
           existing.holidays = dg.holidays;
           existing.leadPerson = dg.leadPerson || '';
@@ -6440,7 +6480,7 @@
     const typeCode = onCallTypeCodeForGroup(state, regionId, typeDefByCode);
     const def = typeDefByCode(typeCode);
     const g = groupById(regionId);
-    hint.textContent = 'Will use "' + (def ? def.label : typeCode) + '" for each weekend, rotating fairly through ' + (g?g.name:'this region') + '\'s roster. Anyone already busy or on holiday that weekend is skipped in favor of the next person in line.';
+    hint.textContent = 'Will use "' + (def ? def.label : typeCode) + '" for each weekend, rotating fairly through ' + (g?g.name:'this region') + '\'s roster' + (g && g.weekendSkipMgmt ? ' (people on Management shifts are left out)' : '') + '. Anyone already busy or on holiday that weekend is skipped in favor of the next person in line.';
   }
   function openWeekendRotationModal(){
     if(!state || !canEdit()) return;
